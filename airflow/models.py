@@ -29,6 +29,7 @@ import copy
 from collections import namedtuple, defaultdict, OrderedDict
 from datetime import timedelta
 
+import codecs
 import dill
 import functools
 import getpass
@@ -57,11 +58,12 @@ from urllib.parse import urlparse, quote, parse_qsl, unquote
 
 from sqlalchemy import (
     Boolean, Column, DateTime, Float, ForeignKey, ForeignKeyConstraint, Index,
-    Integer, LargeBinary, PickleType, String, Text, UniqueConstraint,
+    Integer, JSON, LargeBinary, PickleType, String, Text, UniqueConstraint,
     and_, asc, func, or_, true as sqltrue
 )
 from sqlalchemy.ext.declarative import declarative_base, declared_attr
 from sqlalchemy.orm import reconstructor, relationship, synonym
+from sqlalchemy.sql import exists
 
 from croniter import (
     croniter, CroniterBadCronError, CroniterBadDateError, CroniterNotAlphaError
@@ -73,10 +75,11 @@ from airflow.executors import GetDefaultExecutor, LocalExecutor
 from airflow import configuration
 from airflow.exceptions import (
     AirflowDagCycleException, AirflowException, AirflowSkipException, AirflowTaskTimeout,
-    AirflowRescheduleException
+    AirflowRescheduleException, DagNotFound
 )
 from airflow.dag.base_dag import BaseDag, BaseDagBag
 from airflow.lineage import apply_lineage, prepare_lineage
+from airflow.settings import STORE_SERIALIZED_DAGS, MIN_SERIALIZED_DAG_UPDATE_INTERVAL
 from airflow.ti_deps.deps.not_in_retry_period_dep import NotInRetryPeriodDep
 from airflow.ti_deps.deps.prev_dagrun_dep import PrevDagrunDep
 from airflow.ti_deps.deps.trigger_rule_dep import TriggerRuleDep
@@ -106,6 +109,8 @@ ID_LEN = 250
 XCOM_RETURN_KEY = 'return_value'
 
 Stats = settings.Stats
+
+log = LoggingMixin().log
 
 
 class InvalidFernetToken(Exception):
@@ -253,6 +258,9 @@ class DagBag(BaseDagBag, LoggingMixin):
         file has been skipped. This is to prevent overloading the user with logging
         messages about skipped files. Therefore only once per DagBag is a file logged
         being skipped.
+    :param store_serialized_dags: Read DAGs from DB if store_serialized_dags is ``True``.
+        If ``False`` DAGs are read from python files.
+    :type store_serialized_dags: bool
     """
 
     # static class variables to detetct dag cycle
@@ -264,13 +272,13 @@ class DagBag(BaseDagBag, LoggingMixin):
             self,
             dag_folder=None,
             executor=None,
-            include_examples=configuration.conf.getboolean('core', 'LOAD_EXAMPLES')):
+            include_examples=configuration.conf.getboolean('core', 'LOAD_EXAMPLES'),
+            store_serialized_dags=False):
 
         # do not use default arg in signature, to fix import cycle on plugin load
         if executor is None:
             executor = GetDefaultExecutor()
         dag_folder = dag_folder or settings.DAGS_FOLDER
-        self.log.info("Filling up the DagBag from %s", dag_folder)
         self.dag_folder = dag_folder
         self.dags = {}
         # the file's last modified timestamp when we last read it
@@ -278,8 +286,9 @@ class DagBag(BaseDagBag, LoggingMixin):
         self.executor = executor
         self.import_errors = {}
         self.has_logged = False
+        self.store_serialized_dags = store_serialized_dags
 
-        self.collect_dags(dag_folder, include_examples)
+        self.collect_dags(dag_folder, include_examples=include_examples)
 
     def size(self):
         """
@@ -289,9 +298,23 @@ class DagBag(BaseDagBag, LoggingMixin):
 
     def get_dag(self, dag_id):
         """
-        Gets the DAG out of the dictionary, and refreshes it if expired
+        Gets the DAG out of the dictionary, and refreshes it if expired.
+
+        :param dag_id: DAG Id
+        :type dag_id: str
         """
+        # Only read DAGs from DB if this dagbag is store_serialized_dags.
+        # from_file_only is an exception, currently it is for renderring templates
+        # in UI only. Because functions are gone in serialized DAGs, DAGs must be
+        # imported from files.
+        # FIXME: the upstream supports from_file_only that enforces loading a DAG from file
+        # for renderring templates. It is disgarded in the backport to 1.10.2 because all
+        # access to DAG files in webserver are cut off.
+        if self.store_serialized_dags:
+            return self.dags.get(dag_id)
+
         # If asking for a known subdag, we want to refresh the parent
+        dag = None
         root_dag_id = dag_id
         if dag_id in self.dags:
             dag = self.dags[dag_id]
@@ -527,6 +550,12 @@ class DagBag(BaseDagBag, LoggingMixin):
         **Note**: The patterns in .airflowignore are treated as
         un-anchored regexes, not shell-like glob patterns.
         """
+        if self.store_serialized_dags:
+            self.collect_dags_from_db()
+            Stats.gauge('dagbag_size', len(self.dags), 1)
+            return
+
+        self.log.info("Filling up the DagBag from %s", dag_folder)
         start_dttm = timezone.utcnow()
         dag_folder = dag_folder or self.dag_folder
 
@@ -534,7 +563,7 @@ class DagBag(BaseDagBag, LoggingMixin):
         stats = []
         FileLoadStat = namedtuple(
             'FileLoadStat', "file duration dag_num task_num dags")
-        for filepath in list_py_file_paths(dag_folder, include_examples):
+        for filepath in list_py_file_paths(dag_folder, include_examples=include_examples):
             try:
                 ts = timezone.utcnow()
                 found_dags = self.process_file(
@@ -560,6 +589,27 @@ class DagBag(BaseDagBag, LoggingMixin):
             'dagbag_import_errors', len(self.import_errors), 1)
         self.dagbag_stats = sorted(
             stats, key=lambda x: x.duration, reverse=True)
+
+    def collect_dags_from_db(self):
+        """Collects DAGs from database."""
+        start_dttm = timezone.utcnow()
+        self.log.info("Filling up the DagBag from database")
+
+        # The dagbag contains all rows in serialized_dag table. Deleted DAGs are deleted
+        # from the table by the scheduler job.
+        self.dags = SerializedDagModel.read_all_dags()
+
+        # Adds subdags.
+        # DAG post-processing steps such as self.bag_dag and croniter are not needed as
+        # they are done by scheduler before serialization.
+        subdags = {}
+        for dag in self.dags.values():
+            for subdag in dag.subdags:
+                subdags[subdag.dag_id] = subdag
+        self.dags.update(subdags)
+
+        Stats.timing('collect_db_dags', timezone.utcnow() - start_dttm)
+        Stats.gauge('dagbag_size', len(self.dags), 1)
 
     def dagbag_report(self):
         """Prints a report around DagBag loading stats"""
@@ -1529,7 +1579,13 @@ class TaskInstance(Base, LoggingMixin):
         msg = "Starting attempt {attempt} of {total}".format(
             attempt=self.try_number,
             total=self.max_tries + 1)
+
+        # Set the task start date. In case it was re-scheduled use the initial
+        # start date that is recorded in task_reschedule table
         self.start_date = timezone.utcnow()
+        task_reschedules = TaskReschedule.find_for_task_instance(self, session)
+        if task_reschedules:
+            self.start_date = task_reschedules[0].start_date
 
         dep_context = DepContext(
             deps=RUN_DEPS - QUEUE_DEPS,
@@ -1623,6 +1679,7 @@ class TaskInstance(Base, LoggingMixin):
         self.operator = task.__class__.__name__
 
         context = {}
+        actual_start_date = timezone.utcnow()
         try:
             if not mark_success:
                 context = self.get_template_context()
@@ -1686,7 +1743,7 @@ class TaskInstance(Base, LoggingMixin):
             self.state = State.SKIPPED
         except AirflowRescheduleException as reschedule_exception:
             self.refresh_from_db()
-            self._handle_reschedule(reschedule_exception, test_mode, context)
+            self._handle_reschedule(actual_start_date, reschedule_exception, test_mode, context)
             return
         except AirflowException as e:
             self.refresh_from_db()
@@ -1716,6 +1773,7 @@ class TaskInstance(Base, LoggingMixin):
             session.add(Log(self.state, self))
             session.merge(self)
         session.commit()
+        self.write_metrics()
 
     @provide_session
     def run(
@@ -1758,7 +1816,7 @@ class TaskInstance(Base, LoggingMixin):
         task_copy.dry_run()
 
     @provide_session
-    def _handle_reschedule(self, reschedule_exception, test_mode=False, context=None,
+    def _handle_reschedule(self, actual_start_date, reschedule_exception, test_mode=False, context=None,
                            session=None):
         # Don't record reschedule request in test mode
         if test_mode:
@@ -1769,7 +1827,7 @@ class TaskInstance(Base, LoggingMixin):
 
         # Log reschedule request
         session.add(TaskReschedule(self.task, self.execution_date, self._try_number,
-                    self.start_date, self.end_date,
+                    actual_start_date, self.end_date,
                     reschedule_exception.reschedule_date))
 
         # set state
@@ -1836,6 +1894,7 @@ class TaskInstance(Base, LoggingMixin):
         if not test_mode:
             session.merge(self)
         session.commit()
+        self.write_metrics()
 
     def is_eligible_to_retry(self):
         """Is task instance is eligible for retry"""
@@ -1992,8 +2051,8 @@ class TaskInstance(Base, LoggingMixin):
                     self.task.dag.user_defined_macros)
 
         rt = self.task.render_template  # shortcut to method
-        for attr in task.__class__.template_fields:
-            content = getattr(task, attr)
+        for attr in task.template_fields:
+            content = getattr(task, attr, None)
             if content:
                 rendered_content = rt(attr, content, jinja_context)
                 setattr(task, attr, rendered_content)
@@ -2119,6 +2178,23 @@ class TaskInstance(Base, LoggingMixin):
         """
         self.raw = raw
         self._set_context(self)
+
+    def write_metrics(self):
+        """
+        Write Statsd metrics of task instances for monitoring.
+
+        TODO(zhoufang): sometimes state is set after set_duration, sometimes
+        before. So we have to place this prober at multiple places.
+        It is better to change state, set duration using one method anywhere,
+        and add a prober in that method.
+        """
+        if self.duration is not None and self.state in State.finished():
+            Stats.incr(
+                'task.count.{:s}@-@{:s}@-@{:s}@-@{:s}'.format(
+                    self.dag_id, self.task_id, self.operator, self.state), 1)
+            Stats.gauge(
+                'task.duration.{:s}@-@{:s}@-@{:s}@-@{:s}'.format(
+                    self.dag_id, self.task_id, self.operator, self.state), self.duration)
 
 
 class TaskFail(Base):
@@ -2598,7 +2674,7 @@ class BaseOperator(LoggingMixin):
         if dag:
             self.dag = dag
 
-        self._log = logging.getLogger("airflow.task.operators")
+        # self._log = logging.getLogger("airflow.task.operators")
 
         # lineage
         self.inlets = []
@@ -2844,26 +2920,26 @@ class BaseOperator(LoggingMixin):
 
         for k, v in list(self.__dict__.items()):
             if k not in ('user_defined_macros', 'user_defined_filters',
-                         'params', '_log'):
+                         'params'):
                 setattr(result, k, copy.deepcopy(v, memo))
         result.params = self.params
         if hasattr(self, 'user_defined_macros'):
             result.user_defined_macros = self.user_defined_macros
         if hasattr(self, 'user_defined_filters'):
             result.user_defined_filters = self.user_defined_filters
-        if hasattr(self, '_log'):
-            result._log = self._log
+        # if hasattr(self, '_log'):
+        #     result._log = self._log
         return result
 
-    def __getstate__(self):
-        state = dict(self.__dict__)
-        del state['_log']
+    # def __getstate__(self):
+    #     state = dict(self.__dict__)
+    #     # del state['_log']
 
-        return state
+    #     return state
 
-    def __setstate__(self, state):
-        self.__dict__ = state
-        self._log = logging.getLogger("airflow.task.operators")
+    # def __setstate__(self, state):
+    #     self.__dict__ = state
+        # self._log = logging.getLogger("airflow.task.operators")
 
     def render_template_from_field(self, attr, content, context, jinja_env):
         """
@@ -2920,7 +2996,7 @@ class BaseOperator(LoggingMixin):
     def resolve_template_files(self):
         # Getting the content of files for template_field / template_ext
         for attr in self.template_fields:
-            content = getattr(self, attr)
+            content = getattr(self, attr, None)
             if content is None:
                 continue
             elif isinstance(content, six.string_types) and \
@@ -3228,6 +3304,48 @@ class DagModel(Base):
     def get_current(cls, dag_id, session=None):
         return session.query(cls).filter(cls.dag_id == dag_id).first()
 
+    def get_dag(self, store_serialized_dags=False):
+        """Creates a dagbag to load and return a DAG.
+        Calling it from UI should set store_serialized_dags = STORE_SERIALIZED_DAGS.
+        There may be a delay for scheduler to write serialized DAG into database,
+        loads from file in this case.
+        FIXME: remove it when webserver does not access to DAG folder in future.
+        """
+        dag = DagBag(
+            dag_folder=self.fileloc, store_serialized_dags=store_serialized_dags).get_dag(self.dag_id)
+        if store_serialized_dags and dag is None:
+            dag = self.get_dag()
+        return dag
+
+    @provide_session
+    def set_is_paused(self,
+                      is_paused,
+                      including_subdags=True,
+                      store_serialized_dags=False,
+                      session=None):
+        """
+        Pause/Un-pause a DAG.
+        :param is_paused: Is the DAG paused
+        :param including_subdags: whether to include the DAG's subdags
+        :param store_serialized_dags: whether to serialize DAGs & store it in DB
+        :param session: session
+        """
+        dag_ids = [self.dag_id]
+        if including_subdags:
+            dag = self.get_dag(store_serialized_dags)
+            if dag is None:
+                raise DagNotFound("Dag id {} not found".format(self.dag_id))
+            subdags = dag.subdags
+            dag_ids.extend([subdag.dag_id for subdag in subdags])
+        dag_models = session.query(DagModel).filter(DagModel.dag_id.in_(dag_ids)).all()
+        try:
+            for dag_model in dag_models:
+                dag_model.is_paused = is_paused
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+
 
 @functools.total_ordering
 class DAG(BaseDag, LoggingMixin):
@@ -3324,14 +3442,13 @@ class DAG(BaseDag, LoggingMixin):
             user_defined_macros=None,
             user_defined_filters=None,
             default_args=None,
-            concurrency=configuration.conf.getint('core', 'dag_concurrency'),
-            max_active_runs=configuration.conf.getint(
-                'core', 'max_active_runs_per_dag'),
+            concurrency=None,
+            max_active_runs=None,
             dagrun_timeout=None,
             sla_miss_callback=None,
-            default_view=configuration.conf.get('webserver', 'dag_default_view').lower(),
-            orientation=configuration.conf.get('webserver', 'dag_orientation'),
-            catchup=configuration.conf.getboolean('scheduler', 'catchup_by_default'),
+            default_view=None,
+            orientation=None,
+            catchup=None,
             on_success_callback=None, on_failure_callback=None,
             params=None):
 
@@ -3350,7 +3467,9 @@ class DAG(BaseDag, LoggingMixin):
         # Properties from BaseDag
         self._dag_id = dag_id
         self._full_filepath = full_filepath if full_filepath else ''
-        self._concurrency = concurrency
+        self._concurrency = (configuration.conf.getint('core', 'dag_concurrency')
+                             if concurrency is None
+                             else concurrency)
         self._pickle_id = None
 
         self._description = description
@@ -3397,12 +3516,20 @@ class DAG(BaseDag, LoggingMixin):
         self.parent_dag = None  # Gets set when DAGs are loaded
         self.last_loaded = timezone.utcnow()
         self.safe_dag_id = dag_id.replace('.', '__dot__')
-        self.max_active_runs = max_active_runs
+        self.max_active_runs = (configuration.conf.getint('core', 'max_active_runs_per_dag')
+                                if max_active_runs is None
+                                else max_active_runs)
         self.dagrun_timeout = dagrun_timeout
         self.sla_miss_callback = sla_miss_callback
-        self.default_view = default_view
-        self.orientation = orientation
-        self.catchup = catchup
+        self.default_view = (configuration.conf.get('webserver', 'dag_default_view').lower()
+                             if default_view is None
+                             else default_view)
+        self.orientation = (configuration.conf.get('webserver', 'dag_orientation')
+                            if orientation is None
+                            else orientation)
+        self.catchup = (configuration.conf.getboolean('scheduler', 'catchup_by_default')
+                        if catchup is None
+                        else catchup)
         self.is_subdag = False  # DagBag.bag_dag() will set this to True if appropriate
 
         self.partial = False
@@ -3815,7 +3942,8 @@ class DAG(BaseDag, LoggingMixin):
         for task in self.tasks:
             if (isinstance(task, SubDagOperator) or
                     # TODO remove in Airflow 2.0
-                    type(task).__name__ == 'SubDagOperator'):
+                    type(task).__name__ == 'SubDagOperator' or
+                    task.task_type == 'SubDagOperator'):
                 subdag_lst.append(task.subdag)
                 subdag_lst += task.subdag.subdags
         return subdag_lst
@@ -4417,6 +4545,16 @@ class DAG(BaseDag, LoggingMixin):
 
         for subdag in self.subdags:
             subdag.sync_to_db(owner=owner, sync_time=sync_time, session=session)
+
+        # Write DAGs to serialized_dag table in DB.
+        # subdags are not written into serialized_dag, because they are not displayed
+        # in the DAG list on UI. They are included in the serialized parent DAG.
+        if STORE_SERIALIZED_DAGS and not self.is_subdag:
+            SerializedDagModel.write_dag(
+                self,
+                min_update_interval=MIN_SERIALIZED_DAG_UPDATE_INTERVAL,
+                session=session
+            )
 
     @staticmethod
     @provide_session
@@ -5030,7 +5168,16 @@ class DagRun(Base, LoggingMixin):
     def set_state(self, state):
         if self._state != state:
             self._state = state
-            self.end_date = timezone.utcnow() if self._state in State.finished() else None
+
+            if state in State.finished():
+                self.end_date = timezone.utcnow()
+                Stats.incr(
+                    'workflow.count.{:s}@-@{:s}'.format(self.dag_id, state), 1)
+                Stats.gauge(
+                    'workflow.duration.{:s}@-@{:s}'.format(self.dag_id, state),
+                        (self.end_date-self.start_date).total_seconds())
+            else:
+                self.end_date = None
 
             if self.dag_id is not None:
                 # FIXME: Due to the scoped_session factor we we don't get a clean
@@ -5522,3 +5669,145 @@ class KubeWorkerIdentifier(Base):
                 KubeWorkerIdentifier.worker_uuid: worker_uuid
             })
             session.commit()
+
+
+class SerializedDagModel(Base):
+    """A table for serialized DAGs.
+
+    serialized_dag table is a snapshot of DAG files synchronized by scheduler.
+    This feature is controlled by:
+
+    * ``[core] store_serialized_dags = True``: enable this feature
+    * ``[core] min_serialized_dag_update_interval = 30`` (s):
+      serialized DAGs are updated in DB when a file gets processed by scheduler,
+      to reduce DB write rate, there is a minimal interval of updating serialized DAGs.
+    * ``[scheduler] dag_dir_list_interval = 300`` (s):
+      interval of deleting serialized DAGs in DB when the files are deleted, suggest
+      to use a smaller interval such as 60
+
+    It is used by webserver to load dagbags when ``store_serialized_dags=True``.
+    Because reading from database is lightweight compared to importing from files,
+    it solves the webserver scalability issue.
+    """
+    __tablename__ = 'serialized_dag'
+
+    dag_id = Column(String(ID_LEN), primary_key=True)
+    fileloc = Column(String(2000), nullable=False)
+    # The max length of fileloc exceeds the limit of indexing, use hash for indexing.
+    fileloc_hash = Column(String(40), nullable=False)
+    data = Column(JSON, nullable=False)
+    last_updated = Column(UtcDateTime, nullable=False)
+
+    __table_args__ = (
+        Index('idx_fileloc_hash', fileloc_hash, unique=False),
+    )
+
+    def __init__(self, dag):
+        from airflow.dag.serialization.serialized_dag import SerializedDAG  # noqa: F811, E501; pylint: disable=redefined-outer-name
+
+        self.dag_id = dag.dag_id
+        self.fileloc = dag.full_filepath
+        self.fileloc_hash = self.dag_fileloc_hash(self.fileloc)
+        self.data = SerializedDAG.to_dict(dag)
+        self.last_updated = timezone.utcnow()
+
+    @staticmethod
+    def dag_fileloc_hash(full_filepath):
+        """"Hashing file location for indexing.
+
+        It is used by remove_deleted_dags to compute hash of DAG file path to query DAGs belong to a file.
+
+        :param full_filepath: full filepath of DAG file
+        :return: hashed full_filepath
+        """
+        # FIXME: hashing is needed because the length of fileloc is 2000 as an Airflow convention,
+        # which is over the limit of indexing.
+        return hashlib.sha1(full_filepath.encode('utf-8')).hexdigest()
+
+    @classmethod
+    @provide_session
+    def write_dag(cls, dag, min_update_interval=None, session=None):
+        """Serializes a DAG and writes it into database.
+
+        :param dag: a DAG to be written into database
+        :param min_update_interval: minimal interval in seconds to update serialized DAG
+        :param session: ORM Session
+        """
+        log.debug("Writing DAG: %s to the DB", dag)
+        # Checks if (Current Time - Time when the DAG was written to DB) < min_update_interval
+        # If Yes, does nothing
+        # If No or the DAG does not exists, updates / writes Serialized DAG to DB
+        # FIXME: consider caching last_updated elsewhere to avoid the ahead DB read.
+        if min_update_interval is not None:
+            if session.query(exists().where(
+                and_(cls.dag_id == dag.dag_id,
+                     (timezone.utcnow() - timedelta(seconds=min_update_interval)) < cls.last_updated))
+            ).scalar():
+                return
+        session.merge(cls(dag))
+        log.info("DAG: %s written to the DB", dag)
+
+    @classmethod
+    @provide_session
+    def read_all_dags(cls, session=None):
+        """Reads all DAGs in serialized_dag table.
+
+        :param session: ORM Session
+        :returns: a dict of DAGs read from database
+        """
+        from airflow.dag.serialization.serialized_dag import SerializedDAG  # noqa: F811, E501; pylint: disable=redefined-outer-name
+
+        serialized_dags = session.query(cls.dag_id, cls.data).all()
+
+        dags = {}
+        for dag_id, data in serialized_dags:
+            log.debug("Deserializing DAG: %s", dag_id)
+            if isinstance(data, dict):
+                dag = SerializedDAG.from_dict(data)
+            else:
+                dag = SerializedDAG.from_json(data)
+
+            # Sanity check.
+            if dag.dag_id == dag_id:
+                dags[dag_id] = dag
+            else:
+                log.warning(
+                    "dag_id Mismatch in DB: Row with dag_id '%s' has Serialised DAG "
+                    "with '%s' dag_id", dag_id, dag.dag_id)
+        return dags
+
+    @classmethod
+    @provide_session
+    def remove_dag(cls, dag_id, session=None):
+        """Deletes a DAG with given dag_id.
+
+        :param dag_id: dag_id to be deleted
+        :param session: ORM Session
+        """
+        session.execute(cls.__table__.delete().where(cls.dag_id == dag_id))
+
+    @classmethod
+    @provide_session
+    def remove_deleted_dags(cls, alive_dag_filelocs, session=None):
+        """Deletes DAGs not included in alive_dag_filelocs.
+
+        :param alive_dag_filelocs: file paths of alive DAGs
+        :param session: ORM Session
+        """
+        alive_fileloc_hashes = [
+            cls.dag_fileloc_hash(fileloc) for fileloc in alive_dag_filelocs]
+
+        session.execute(
+            cls.__table__.delete().where(
+                and_(cls.fileloc_hash.notin_(alive_fileloc_hashes),
+                     cls.fileloc.notin_(alive_dag_filelocs))))
+
+    @classmethod
+    @provide_session
+    def has_dag(cls, dag_id, session=None):
+        """Checks a DAG exist in serialized_dag table.
+
+        :param dag_id: the DAG to check
+        :param session: ORM Session
+        """
+        return session.query(exists().where(cls.dag_id == dag_id)).scalar()

@@ -270,7 +270,6 @@ def parse_template_string(template_string):
     else:
         return template_string, None
 
-
 class AirflowImporter(object):
     """
     Importer that dynamically loads a class and module from its parent. This

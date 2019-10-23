@@ -26,6 +26,7 @@ import atexit
 import logging
 import os
 import pendulum
+import socket
 
 from sqlalchemy import create_engine, exc
 from sqlalchemy.orm import scoped_session, sessionmaker
@@ -71,16 +72,17 @@ class DummyStatsLogger(object):
 
 Stats = DummyStatsLogger
 
-if conf.getboolean('scheduler', 'statsd_on'):
-    from statsd import StatsClient
+try:
+    if conf.getboolean('scheduler', 'statsd_on'):
+        from statsd import StatsClient
 
-    statsd = StatsClient(
-        host=conf.get('scheduler', 'statsd_host'),
-        port=conf.getint('scheduler', 'statsd_port'),
-        prefix=conf.get('scheduler', 'statsd_prefix'))
-    Stats = statsd
-else:
-    Stats = DummyStatsLogger
+        statsd = StatsClient(
+            host=conf.get('scheduler', 'statsd_host'),
+            port=conf.getint('scheduler', 'statsd_port'),
+            prefix=conf.get('scheduler', 'statsd_prefix'))
+        Stats = statsd
+except (socket.gaierror, ImportError):
+    log.warning("Could not configure StatsClient, using DummyStatsLogger instead.")
 
 HEADER = """\
   ____________       _____________
@@ -275,3 +277,18 @@ KILOBYTE = 1024
 MEGABYTE = KILOBYTE * KILOBYTE
 WEB_COLORS = {'LIGHTBLUE': '#4d9de0',
               'LIGHTORANGE': '#FF9933'}
+
+# If store_serialized_dags is True, scheduler writes serialized DAGs to DB, and webserver
+# reads DAGs from DB instead of importing from files.
+try:
+    STORE_SERIALIZED_DAGS = conf.getboolean('core', 'store_serialized_dags')
+except Exception:
+    STORE_SERIALIZED_DAGS = False
+
+# Updating serialized DAG can not be faster than a minimum interval to reduce database
+# write rate.
+try:
+    MIN_SERIALIZED_DAG_UPDATE_INTERVAL = conf.getint(
+        'core', 'min_serialized_dag_update_interval')
+except Exception:
+    MIN_SERIALIZED_DAG_UPDATE_INTERVAL = 30

@@ -190,6 +190,7 @@ class DataFlowHook(GoogleCloudBaseHook):
         return build(
             'dataflow', 'v1b3', http=http_authorized, cache_discovery=False)
 
+    @GoogleCloudBaseHook._Decorators.provide_gcp_credential_file
     def _start_dataflow(self, task_id, variables, name,
                         command_prefix, label_formatter):
         variables = self._set_variables(variables)
@@ -223,6 +224,7 @@ class DataFlowHook(GoogleCloudBaseHook):
 
     def start_template_dataflow(self, task_id, variables, parameters, dataflow_template,
                                 append_job_name=True):
+        variables = self._set_variables(variables)
         name = self._build_dataflow_job_name(task_id, append_job_name)
         self._start_template_dataflow(
             name, variables, parameters, dataflow_template)
@@ -236,7 +238,7 @@ class DataFlowHook(GoogleCloudBaseHook):
             return ['--labels={}={}'.format(key, value)
                     for key, value in labels_dict.items()]
         self._start_dataflow(task_id, variables, name,
-                             ["python"] + py_options + [dataflow],
+                             ["python2"] + py_options + [dataflow],
                              label_formatter)
 
     @staticmethod
@@ -282,8 +284,9 @@ class DataFlowHook(GoogleCloudBaseHook):
                 "parameters": parameters,
                 "environment": environment}
         service = self.get_conn()
-        request = service.projects().templates().launch(
+        request = service.projects().locations().templates().launch(
             projectId=variables['project'],
+            location=variables['region'],
             gcsPath=dataflow_template,
             body=body
         )

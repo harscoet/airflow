@@ -24,13 +24,20 @@ import httplib2
 import google.auth
 import google_auth_httplib2
 import google.oauth2.service_account
+import os
+import tempfile
 
 from airflow.exceptions import AirflowException
 from airflow.hooks.base_hook import BaseHook
 from airflow.utils.log.logging_mixin import LoggingMixin
+from airflow.version import version
 
 
 _DEFAULT_SCOPES = ('https://www.googleapis.com/auth/cloud-platform',)
+# The name of the environment variable that Google Authentication library uses
+# to get service account key location. Read more:
+# https://cloud.google.com/docs/authentication/getting-started#setting_the_environment_variable
+_G_APP_CRED_ENV_VAR = "GOOGLE_APPLICATION_CREDENTIALS"
 
 
 class GoogleCloudBaseHook(BaseHook, LoggingMixin):
@@ -126,13 +133,39 @@ class GoogleCloudBaseHook(BaseHook, LoggingMixin):
         """
         return self._get_credentials().token
 
+    def _set_user_agent(self, http, user_agent):
+        """
+        Set the user-agent on every request.
+        """
+        request_orig = http.request
+
+        # The closure that will replace 'httplib2.Http.request'.
+        def new_request(uri, method='GET', body=None, headers=None,
+                        redirections=httplib2.DEFAULT_MAX_REDIRECTS,
+                        connection_type=None):
+            """Modify the request headers to add the user-agent."""
+            new_headers = {}
+            if headers is not None:
+                new_headers = headers.copy()
+            if 'user-agent' in new_headers:
+                new_headers['user-agent'] = user_agent + ' ' + new_headers['user-agent']
+            else:
+                new_headers['user-agent'] = user_agent
+            resp, content = request_orig(uri, method, body, new_headers,
+                                redirections, connection_type)
+            return resp, content
+
+        http.request = new_request
+        return http
+
+
     def _authorize(self):
         """
         Returns an authorized HTTP object to be used to build a Google cloud
         service hook connection.
         """
         credentials = self._get_credentials()
-        http = httplib2.Http()
+        http = self._set_user_agent(httplib2.Http(), 'airflow-{}'.format(version))
         authed_http = google_auth_httplib2.AuthorizedHttp(
             credentials, http=http)
         return authed_http
@@ -193,3 +226,31 @@ class GoogleCloudBaseHook(BaseHook, LoggingMixin):
         :return: the project_id specified or default project id if project_id is None
         """
         return project_id if project_id else self.project_id
+
+    class _Decorators(object):
+        """A private inner class for keeping all decorator methods."""
+
+        @staticmethod
+        def provide_gcp_credential_file(func):
+            """
+            Function decorator that provides a GOOGLE_APPLICATION_CREDENTIALS
+            environment variable, pointing to file path of a JSON file of service
+            account key.
+            """
+            @functools.wraps(func)
+            def wrapper(self, *args, **kwargs):
+                with tempfile.NamedTemporaryFile(mode='w+t') as conf_file:
+                    key_path = self._get_field('key_path', False)
+                    keyfile_dict = self._get_field('keyfile_dict', False)
+                    if key_path:
+                        if key_path.endswith('.p12'):
+                            raise AirflowException(
+                                'Legacy P12 key file are not supported, '
+                                'use a JSON key file.')
+                        os.environ[_G_APP_CRED_ENV_VAR] = key_path
+                    elif keyfile_dict:
+                        conf_file.write(keyfile_dict)
+                        conf_file.flush()
+                        os.environ[_G_APP_CRED_ENV_VAR] = conf_file.name
+                    return func(self, *args, **kwargs)
+            return wrapper

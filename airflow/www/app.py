@@ -17,6 +17,9 @@
 # specific language governing permissions and limitations
 # under the License.
 #
+import json
+import logging
+import os
 import six
 
 from flask import Flask
@@ -38,9 +41,20 @@ from airflow import jobs
 from airflow import settings
 from airflow import configuration
 from airflow.utils.net import get_hostname
+from airflow.utils.json import AirflowJsonEncoder
 
 csrf = CSRFProtect()
 
+try:
+    with open('/home/airflow/gcs/env_var.json', 'r') as env_var_json:
+        os.environ.update(json.load(env_var_json))
+except:
+    logging.warning('Using default Composer Environment Variables. Overrides '
+                    'have not been applied.')
+configuration = six.moves.reload_module(configuration)
+airflow.configuration = six.moves.reload_module(airflow.configuration)
+airflow.plugins_manager = six.moves.reload_module(airflow.plugins_manager)
+airflow = six.moves.reload_module(airflow)
 
 def create_app(config=None, testing=False):
     app = Flask(__name__)
@@ -50,9 +64,16 @@ def create_app(config=None, testing=False):
     app.config['LOGIN_DISABLED'] = not configuration.conf.getboolean(
         'webserver', 'AUTHENTICATE')
 
+    # Configure the JSON encoder used by `|tojson` filter from Flask
+    app.json_encoder = AirflowJsonEncoder
+
     csrf.init_app(app)
 
     app.config['TESTING'] = testing
+    try:
+        app.config['WEB_SERVER_NAME'] = configuration.get('webserver', 'WEB_SERVER_NAME')
+    except:
+        app.config['WEB_SERVER_NAME'] = ''
 
     airflow.load_login()
     airflow.login.login_manager.init_app(app)
