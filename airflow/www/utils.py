@@ -40,6 +40,7 @@ from flask import after_this_request, request, Response
 from flask_admin.model import filters
 import flask_admin.contrib.sqla.filters as sqlafilters
 from flask_login import current_user
+from six import string_types
 
 from airflow import configuration, models, settings
 from airflow.utils.db import create_session
@@ -405,6 +406,12 @@ def get_python_source(x):
     """
     Helper function to get Python source (or not), preventing exceptions
     """
+    if x is None:
+        return None
+
+    if isinstance(x, string_types):
+        return x
+
     source_code = None
 
     if isinstance(x, functools.partial):
@@ -426,6 +433,22 @@ def get_python_source(x):
         source_code = 'No source code available for {}'.format(type(x))
 
     return source_code
+
+
+def make_serialized_dags_env_var_file(store_serialized_dags, serialized_dags_env_file):
+    """Makes a file storing an env var representing Airflow config [core] store_serialized_dags."""
+
+    serialized_dags_env = 'STORE_SERIALIZED_DAGS=1' if store_serialized_dags else 'STORE_SERIALIZED_DAGS=0'
+
+    if not os.path.isfile(serialized_dags_env_file):
+        write_file = True
+    else:
+        with open(serialized_dags_env_file, 'r') as f:
+            write_file = (f.readline().strip(' \n') != serialized_dags_env)
+
+    if write_file:
+        with open(serialized_dags_env_file, 'w+') as f:
+            f.write(serialized_dags_env + '\n')
 
 
 class AceEditorWidget(wtforms.widgets.TextArea):
